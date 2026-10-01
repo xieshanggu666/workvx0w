@@ -409,21 +409,26 @@ function rebuildStandings(sportId) {
     const teams = all(`SELECT id FROM teams WHERE sport_id=? AND status='approved'`, sid).map(t => t.id)
     teams.forEach(t => run('INSERT INTO standings (sport_id,team_id) VALUES (?,?)', sid, t))
     const done = all(`SELECT * FROM matches WHERE sport_id=? AND status='finished'`, sid)
+    const applyRow = (row, my, opp) => {
+      row.play += 1
+      row.gf += my; row.ga += opp
+      if (my > opp) { row.win++; row.points += 3 }
+      else if (my < opp) { row.lose++; row.points += 0 }
+      else { row.draw++; row.points += 1 }
+    }
     done.forEach(m => {
-      const rowA = get('SELECT * FROM standings WHERE sport_id=? AND team_id=?', sid, m.team_a)
-      const rowB = get('SELECT * FROM standings WHERE sport_id=? AND team_id=?', sid, m.team_b)
-      if (!rowA || !rowB) return
-      const sa = m.score_a, sb = m.score_b
       // 已存在记录则不重复累加
       if (m._acc) return
-      rowA.play += 1; rowB.play += 1
-      rowA.gf += sa; rowA.ga += sb; rowB.gf += sb; rowB.ga += sa
-      if (sa > sb) { rowA.win++; rowB.lose++; rowA.points += 3 }
-      else if (sa < sb) { rowB.win++; rowA.lose++; rowB.points += 3 }
-      else { rowA.draw++; rowB.draw++; rowA.points += 1; rowB.points += 1 }
-      run('UPDATE standings SET play=?,win=?,draw=?,lose=?,gf=?,ga=?,points=? WHERE id=?',
+      const rowA = get('SELECT * FROM standings WHERE sport_id=? AND team_id=?', sid, m.team_a)
+      const rowB = get('SELECT * FROM standings WHERE sport_id=? AND team_id=?', sid, m.team_b)
+      const sa = m.score_a, sb = m.score_b
+      // 退报/撤销队不在积分榜：弃权 0:3 仍给在赛一方计胜（另一方已无榜单行，不累计）
+      if (rowA) applyRow(rowA, sa, sb)
+      if (rowB) applyRow(rowB, sb, sa)
+      if (!rowA && !rowB) return
+      if (rowA) run('UPDATE standings SET play=?,win=?,draw=?,lose=?,gf=?,ga=?,points=? WHERE id=?',
         rowA.play, rowA.win, rowA.draw, rowA.lose, rowA.gf, rowA.ga, rowA.points, rowA.id)
-      run('UPDATE standings SET play=?,win=?,draw=?,lose=?,gf=?,ga=?,points=? WHERE id=?',
+      if (rowB) run('UPDATE standings SET play=?,win=?,draw=?,lose=?,gf=?,ga=?,points=? WHERE id=?',
         rowB.play, rowB.win, rowB.draw, rowB.lose, rowB.gf, rowB.ga, rowB.points, rowB.id)
       m._acc = 1
     })
@@ -452,11 +457,13 @@ function recomputeMedals() {
     } else {
       const fin = get(`SELECT * FROM matches WHERE sport_id=? AND status='finished' AND stage='决赛'`, spo.id)
       if (fin && fin.winner != null) {
-        add(unitOfTeam(fin.winner), 'gold')
-        add(unitOfTeam(fin.winner === fin.team_a ? fin.team_b : fin.team_a), 'silver')
+        // 失格队伍（退报/撤销）不进入奖牌：胜方仍具资格才发金牌；负者仍具资格才发银牌
+        if (teamActive(fin.winner)) add(unitOfTeam(fin.winner), 'gold')
+        const finLoser = fin.winner === fin.team_a ? fin.team_b : fin.team_a
+        if (teamActive(finLoser)) add(unitOfTeam(finLoser), 'silver')
       }
       const thirdM = get(`SELECT * FROM matches WHERE sport_id=? AND status='finished' AND stage='季军'`, spo.id)
-      if (thirdM && thirdM.winner != null) add(unitOfTeam(thirdM.winner), 'bronze')
+      if (thirdM && thirdM.winner != null && teamActive(thirdM.winner)) add(unitOfTeam(thirdM.winner), 'bronze')
     }
   })
 }
@@ -539,23 +546,38 @@ function initRoundRobinSchedule(sportId, oldMatches) {
   }
 }
 
+function teamActive(teamId) {
+  return !!teamId && get('SELECT status FROM teams WHERE id=?', teamId)?.status === 'approved'
+}
+// 队伍是否仍具备参赛资格（退报/撤销/驳回/待审均视为失格）
+// 生成季军战：两名半决赛负者都仍具资格时才排定，否则铜牌待组委会裁定
+function makeThirdPlace(sportId, l1, l2, venueName, orderNo, timeLabel) {
+  if (!teamActive(l1) || !teamActive(l2)) return null
+  const r = run('INSERT INTO matches (sport_id,stage,team_a,team_b,venue_id,order_no,time_label,status) VALUES (?,?,?,?,?,?,?,?)',
+    sportId, '季军', l1, l2, vid(venueName), orderNo, timeLabel, 'scheduled')
+  return Number(r.lastInsertRowid)
+}
+
 function generateKO(sportId) {
   const spo = get('SELECT * FROM sports WHERE id=?', sportId)
   if (spo.format === 'knockout') {
-    // 羽毛球：半决赛是否已全部完成
+    // 羽毛球：半决赛是否已全部完成（含已取消=成绩取消终态）
     const semis = all(`SELECT * FROM matches WHERE sport_id=? AND stage='半决赛'`, sportId)
-    const hasFinal = get(`SELECT id FROM matches WHERE sport_id=? AND stage='决赛'`, sportId)
-    if (semis.length && semis.every(s => s.status === 'finished') && !hasFinal) {
+    const liveFinal = get(`SELECT id FROM matches WHERE sport_id=? AND stage='决赛' AND status!='void'`, sportId)
+    if (semis.length && semis.every(s => s.status === 'finished') && !liveFinal) {
       if (semis.some(s => s.winner == null)) return '半决赛存在平分未决胜场次，请先补录加时/点球决胜比分'
+      if (semis.some(s => !teamActive(s.winner))) return '半决赛胜方存在已退报/撤销队伍，请先处理资格再编排'
       const w1 = semis[0].winner, w2 = semis[1].winner
       const l1 = loserOf(semis[0]), l2 = loserOf(semis[1])
       const r1 = run('INSERT INTO matches (sport_id,stage,team_a,team_b,venue_id,order_no,time_label,status) VALUES (?,?,?,?,?,?,?,?)', sportId, '决赛', w1, w2, vid('羽毛球馆'), 9, '13:00', 'scheduled')
-      const r2 = run('INSERT INTO matches (sport_id,stage,team_a,team_b,venue_id,order_no,time_label,status) VALUES (?,?,?,?,?,?,?,?)', sportId, '季军', l1, l2, vid('备用2号场'), 10, '12:30', 'scheduled')
-      const ids = [Number(r1.lastInsertRowid), Number(r2.lastInsertRowid)]
+      const ids = [Number(r1.lastInsertRowid)]
+      const liveThird = get(`SELECT id FROM matches WHERE sport_id=? AND stage='季军' AND status!='void'`, sportId)
+      const thirdId = !liveThird ? makeThirdPlace(sportId, l1, l2, '备用2号场', 10, '12:30') : null
+      if (thirdId) ids.push(thirdId)
       ids.forEach(id => addLog('schedule_added', id, null, `${matchTitle(get('SELECT * FROM matches WHERE id=?', id))} 由淘汰赛编排生成`, null, '系统'))
       // 赛程变更同步更新执法安排：新场次自动排班（无可用裁判时留待排班页处理）
       autoChiefForNewMatches(ids, '系统')
-      return '已生成羽毛球 决赛 与 季军战'
+      return thirdId ? '已生成羽毛球 决赛 与 季军战' : '已生成羽毛球 决赛（半决赛负者已失格，暂不生成季军战，铜牌待裁定）'
     }
     return null
   }
@@ -564,16 +586,20 @@ function generateKO(sportId) {
   const done = {}
   groups.forEach(g => {
     const gms = all(`SELECT * FROM matches WHERE sport_id=? AND group_name=?`, sportId, g)
-    done[g] = gms.length === 0 || gms.every(m => m.status === 'finished')
+    // 完赛或取消（退报成绩作废）均视为该组已终局
+    done[g] = gms.length === 0 || gms.every(m => m.status === 'finished' || m.status === 'void')
   })
-  const hasSemi = get(`SELECT id FROM matches WHERE sport_id=? AND stage='半决赛'`, sportId)
-  if (groups.every(g => done[g]) && !hasSemi) {
+  const liveSemi = get(`SELECT id FROM matches WHERE sport_id=? AND stage='半决赛' AND status!='void'`, sportId)
+  if (groups.every(g => done[g]) && !liveSemi) {
     const rankOf = g => {
-      const ids = all(`SELECT DISTINCT team_a id FROM matches WHERE sport_id=? AND group_name=? AND team_a IS NOT NULL UNION SELECT DISTINCT team_b FROM matches WHERE sport_id=? AND group_name=? AND team_b IS NOT NULL`, sportId, g, sportId, g)
-        .map(r => r.id)
-        .filter(id => get('SELECT status FROM teams WHERE id=?', id)?.status === 'approved')
-      // 与积分榜同一排名口径（积分 → 净胜球），避免同分时晋级对阵与榜单不一致
-      return ids.map(id => ({ id, rank: get('SELECT rank r FROM standings WHERE sport_id=? AND team_id=?', sportId, id)?.r ?? 999 })).sort((a, b) => a.rank - b.rank).map(r => r.id)
+      // 小组队伍直接按积分榜排名（approved 队伍才在榜），口径与积分榜一致
+      const gids = new Set(all(`SELECT DISTINCT team_a id FROM matches WHERE sport_id=? AND group_name=? AND team_a IS NOT NULL
+              UNION SELECT DISTINCT team_b FROM matches WHERE sport_id=? AND group_name=? AND team_b IS NOT NULL`,
+        sportId, g, sportId, g).map(r => r.id))
+      return all('SELECT team_id,rank FROM standings WHERE sport_id=?', sportId)
+        .filter(r => gids.has(r.team_id))
+        .sort((a, b) => a.rank - b.rank)
+        .map(r => r.team_id)
     }
     const A = rankOf('A组'), B = rankOf('B组')
     if (A.length >= 2 && B.length >= 2) {
@@ -587,17 +613,20 @@ function generateKO(sportId) {
     return null
   }
   const semis = all(`SELECT * FROM matches WHERE sport_id=? AND stage='半决赛'`, sportId)
-  const hasFinal = get(`SELECT id FROM matches WHERE sport_id=? AND stage='决赛'`, sportId)
-  if (semis.length && semis.every(s => s.status === 'finished') && !hasFinal) {
+  const liveFinal = get(`SELECT id FROM matches WHERE sport_id=? AND stage='决赛' AND status!='void'`, sportId)
+  if (semis.length && semis.every(s => s.status === 'finished') && !liveFinal) {
     if (semis.some(s => s.winner == null)) return '半决赛存在平分未决胜场次，请先补录加时/点球决胜比分'
+    if (semis.some(s => !teamActive(s.winner))) return '半决赛胜方存在已退报/撤销队伍，请先处理资格再编排'
     const w1 = semis[0].winner, w2 = semis[1].winner
     const l1 = loserOf(semis[0]), l2 = loserOf(semis[1])
     const r1 = run('INSERT INTO matches (sport_id,stage,team_a,team_b,venue_id,order_no,time_label,status) VALUES (?,?,?,?,?,?,?,?)', sportId, '决赛', w1, w2, vid('五人足球场'), 101, '16:00', 'scheduled')
-    const r2 = run('INSERT INTO matches (sport_id,stage,team_a,team_b,venue_id,order_no,time_label,status) VALUES (?,?,?,?,?,?,?,?)', sportId, '季军', l1, l2, vid('备用2号场'), 102, '15:30', 'scheduled')
-    const ids = [Number(r1.lastInsertRowid), Number(r2.lastInsertRowid)]
+    const ids = [Number(r1.lastInsertRowid)]
+    const liveThird = get(`SELECT id FROM matches WHERE sport_id=? AND stage='季军' AND status!='void'`, sportId)
+    const thirdId = !liveThird ? makeThirdPlace(sportId, l1, l2, '备用2号场', 102, '15:30') : null
+    if (thirdId) ids.push(thirdId)
     ids.forEach(id => addLog('schedule_added', id, null, `${matchTitle(get('SELECT * FROM matches WHERE id=?', id))} 由半决赛赛果生成`, null, '系统'))
     autoChiefForNewMatches(ids, '系统')
-    return '已生成决赛 与 季军战'
+    return thirdId ? '已生成决赛 与 季军战' : '已生成决赛（半决赛负者已失格，暂不生成季军战，铜牌待裁定）'
   }
   return null
 }
@@ -685,6 +714,75 @@ function rejectRegistration(regId, note, reviewer) {
   return { ok: true }
 }
 
+// 移除一场失效的派生性未赛场次：解除在派裁判并留痕（历史执法记录与日志保留可追溯）
+function removeDerivedMatch(m, why, operator = '系统') {
+  releaseAssignmentsOfMatch(m, why, operator)
+  addLog('schedule_rebuild', m.id, null, `${matchTitle(m)} 因上游赛果/资格失效移除：${why}`, why, operator)
+  run('DELETE FROM matches WHERE id=?', m.id)
+}
+
+// 小组按积分榜口径的当前出线排名（approved 队伍，积分 → 净胜球）
+function groupRanks(sportId, g) {
+  return all(`SELECT DISTINCT team_a id FROM matches WHERE sport_id=? AND group_name=? AND team_a IS NOT NULL
+              UNION SELECT DISTINCT team_b FROM matches WHERE sport_id=? AND group_name=? AND team_b IS NOT NULL`,
+    sportId, g, sportId, g)
+    .map(r => r.id)
+    .filter(id => teamActive(id))
+    .map(id => ({ id, rank: get('SELECT rank r FROM standings WHERE sport_id=? AND team_id=?', sportId, id)?.r ?? 999 }))
+    .sort((a, b) => a.rank - b.rank)
+    .map(r => r.id)
+}
+
+// 半决赛均已完赛且胜方仍具资格时，核对未赛决赛/季军：对阵不符或任一方失格则移除
+function validateDownstreamFromSemis(semis, finals, why, operator) {
+  let removed = 0
+  if (!semis.length || !semis.every(m => m.status === 'finished' && teamActive(m.winner))) return 0
+  const winners = [semis[0].winner, semis[1].winner]
+  const losers = [loserOf(semis[0]), loserOf(semis[1])]
+  finals.forEach(m => {
+    if (m.status !== 'scheduled') return   // 已完赛（含弃权 3:0）/已取消的结果保留
+    const sides = m.stage === '决赛' ? winners : losers
+    const pairOk = sides.every(teamActive) &&
+      ((m.team_a === sides[0] && m.team_b === sides[1]) || (m.team_a === sides[1] && m.team_b === sides[0]))
+    if (!pairOk) { removeDerivedMatch(m, why, operator); removed++ }
+  })
+  return removed
+}
+
+// 退报/撤销后对账淘汰赛派生性：
+//  · group_knockout：小组成绩取消导致出线排名变化时，未开赛的半决赛整体作废按最新排名重排；
+//  · 两种赛制：半决赛被取消/胜方失格，或半决赛改判后决赛/季军对阵与最新赛果不符的【未赛】场次，一律移除，
+//    由组委会在「赛程编排」重新编排。已完赛结果（含退队弃权 3:0）不删除。
+function reconcileKnockout(sportId, why, operator = '系统') {
+  const spo = get('SELECT * FROM sports WHERE id=?', sportId)
+  if (!spo || (spo.format !== 'knockout' && spo.format !== 'group_knockout')) return 0
+  const semis = all(`SELECT * FROM matches WHERE sport_id=? AND stage='半决赛'`, sportId)
+  const finals = all(`SELECT * FROM matches WHERE sport_id=? AND stage IN ('决赛','季军')`, sportId)
+
+  if (spo.format === 'group_knockout' && semis.length && semis.every(m => m.status === 'scheduled')) {
+    // 半决赛均未开赛：按小组最新排名核对交叉对位，失配则作废重排（已有半决赛完赛则保留赛果，不追溯）
+    const A = groupRanks(sportId, 'A组'), B = groupRanks(sportId, 'B组')
+    const pairs = [[A[0], B[1]], [B[0], A[1]]]
+    const samePair = (m, x, y) => x != null && y != null && ((m.team_a === x && m.team_b === y) || (m.team_a === y && m.team_b === x))
+    const stale = A.length < 2 || B.length < 2 ||
+      semis.some(m => !pairs.some(([x, y]) => samePair(m, x, y)) || !teamActive(m.team_a) || !teamActive(m.team_b))
+    if (stale) {
+      let removed = 0
+      ;[...semis, ...finals].forEach(m => { if (m.status === 'scheduled') { removeDerivedMatch(m, why, operator); removed++ } })
+      return removed
+    }
+  }
+
+  // 任一半决赛被取消、或其胜方失格（双保险，正常退报流程已改判递补）→ 未赛后续轮次全部移除
+  const broken = semis.some(m => m.status === 'void' || (m.status === 'finished' && !teamActive(m.winner)))
+  if (broken) {
+    let removed = 0
+    finals.forEach(m => { if (m.status === 'scheduled') { removeDerivedMatch(m, why, operator); removed++ } })
+    return removed
+  }
+  return validateDownstreamFromSemis(semis, finals, why, operator)
+}
+
 // 退报（单位主动）/ 撤销资格（组委会）：同步处理受影响的对阵及成绩
 function withdrawOrRevoke(regId, action, note, reviewer) {
   const reg = get('SELECT * FROM registrations WHERE id=?', regId)
@@ -692,29 +790,68 @@ function withdrawOrRevoke(regId, action, note, reviewer) {
   if (reg.status !== 'approved') throw new Error('仅已通过的报名可退报/撤销')
   const newStatus = action === 'withdraw' ? 'withdrawn' : 'revoked'
   const reason = note || (action === 'withdraw' ? '单位退报' : '组委会撤销资格')
+  const why = action === 'withdraw' ? '队伍退报' : '资格撤销'
   run(`UPDATE registrations SET status=?, review_note=?, reviewed_at=datetime('now','localtime'), reviewer=? WHERE id=?`, newStatus, reason, reviewer || '组委会', regId)
-  const impact = { voided: 0, walkover: 0, entries: 0 }
+  const impact = { voided: 0, walkover: 0, entries: 0, rebuilt: 0 }
   if (reg.kind === 'team') {
     run(`UPDATE teams SET status=? WHERE id=?`, newStatus, reg.team_id)
-    // 同步处理受影响的对阵
-    const ms = all(`SELECT * FROM matches WHERE sport_id=? AND (team_a=? OR team_b=?)`, reg.sport_id, reg.team_id, reg.team_id)
-    ms.forEach(m => {
+    const spo = get('SELECT * FROM sports WHERE id=?', reg.sport_id)
+    const koSport = spo.format === 'knockout' || spo.format === 'group_knockout'
+    const removedIds = new Set()
+    // 处理单场受影响比赛：未赛判对手 3:0 弃权；已赛按轮次取消或改判递补
+    const applyMatch = m => {
+      const isA = m.team_a === reg.team_id
+      const opp = isA ? m.team_b : m.team_a
       if (m.status === 'scheduled') {
-        // 未赛：判弃权，对手 3:0 胜；裁判安排随比赛状态联动归档
-        const isA = m.team_a === reg.team_id
-        run(`UPDATE matches SET status='finished', score_a=?, score_b=?, winner=?, note=? WHERE id=?`,
-          isA ? 0 : 3, isA ? 3 : 0, isA ? m.team_b : m.team_a, action === 'withdraw' ? '弃权(退报)' : '弃权(撤销资格)', m.id)
+        // 未赛（含小组/半决赛/决赛/季军）：判弃权，对手 3:0 胜——淘汰赛对手据此递补晋级/合法夺冠，
+        // 执法安排随完赛归档；对账阶段再移除对阵来源已变化的其它派生场次
+        run(`UPDATE matches SET status='finished', score_a=?, score_b=?, tb_a=NULL, tb_b=NULL, winner=?, note=? WHERE id=?`,
+          isA ? 0 : 3, isA ? 3 : 0, opp, action === 'withdraw' ? '弃权(退报)' : '弃权(撤销资格)', m.id)
         impact.walkover++
         lockAssignmentsOnFinish({ ...m, status: 'finished' }, reviewer || '系统')
       } else if (m.status === 'finished') {
-        // 已赛：取消该场成绩，并解除/归档执法安排
-        run(`UPDATE matches SET status='void', score_a=NULL, score_b=NULL, tb_a=NULL, tb_b=NULL, winner=NULL, note=? WHERE id=?`,
-          action === 'withdraw' ? '成绩取消(退报)' : '成绩取消(撤销资格)', m.id)
-        impact.voided++
-        releaseAssignmentsOfMatch(m, action === 'withdraw' ? '成绩取消(退报)' : '成绩取消(撤销资格)', reviewer || '系统')
+        if (koSport && m.stage === '半决赛' && m.winner === reg.team_id) {
+          // 退队是半决赛胜方：原赛果作废，改判对手 3:0 递补晋级；后续轮次按新胜方重新对账。
+          // 退队仅为负方时，对手本就合法晋级，真实赛果保留不动
+          run(`UPDATE matches SET score_a=?, score_b=?, tb_a=NULL, tb_b=NULL, winner=?, note=? WHERE id=?`,
+            isA ? 0 : 3, isA ? 3 : 0, opp, `${action === 'withdraw' ? '对方退报' : '对方资格撤销'}，改判 3:0 递补晋级`, m.id)
+          addLog('match_change', m.id, null, `${matchTitle(m)}：胜方${why}，对手 3:0 递补晋级`, reason, reviewer || '系统')
+        } else if (m.stage !== '半决赛') {
+          // 小组/循环已赛：取消该场成绩；淘汰赛决赛/季军已赛：取消成绩，该项目奖牌不再由该场结算
+          run(`UPDATE matches SET status='void', score_a=NULL, score_b=NULL, tb_a=NULL, tb_b=NULL, winner=NULL, note=? WHERE id=?`,
+            action === 'withdraw' ? '成绩取消(退报)' : '成绩取消(撤销资格)', m.id)
+          impact.voided++
+          releaseAssignmentsOfMatch(m, action === 'withdraw' ? '成绩取消(退报)' : '成绩取消(撤销资格)', reviewer || '系统')
+        }
       }
-    })
+    }
+    let ms = all(`SELECT * FROM matches WHERE sport_id=? AND (team_a=? OR team_b=?)`, reg.sport_id, reg.team_id, reg.team_id)
+    if (spo.format === 'group_knockout') {
+      // 小组+淘汰赛项目：先处理小组场次并重算积分排名
+      ms.filter(m => m.group_name).forEach(applyMatch)
+      rebuildStandings(reg.sport_id)
+      // 淘汰赛尚未开赛（半决赛全部待赛）：出线口径因退报/小组成绩取消变化时，
+      // 整体作废半决赛及后续轮次，由组委会按最新小组排名重新编排（递补队正确占签，而非轮空）
+      const semisAll = all(`SELECT * FROM matches WHERE sport_id=? AND stage='半决赛'`, reg.sport_id)
+      if (semisAll.length && semisAll.every(x => x.status === 'scheduled')) {
+        const A = groupRanks(reg.sport_id, 'A组'), B = groupRanks(reg.sport_id, 'B组')
+        const pairs = [[A[0], B[1]], [B[0], A[1]]]
+        const samePair = (x, a, b) => a != null && b != null && ((x.team_a === a && x.team_b === b) || (x.team_a === b && x.team_b === a))
+        const stale = A.length < 2 || B.length < 2 ||
+          semisAll.some(x => !teamActive(x.team_a) || !teamActive(x.team_b) || !pairs.some(([a, b]) => samePair(x, a, b)))
+        if (stale) {
+          all(`SELECT * FROM matches WHERE sport_id=? AND stage IN ('半决赛','决赛','季军')`, reg.sport_id)
+            .forEach(x => { if (x.status === 'scheduled') { removeDerivedMatch(x, why, reviewer || '系统'); removedIds.add(x.id); impact.rebuilt++ } })
+        }
+      }
+      // 再处理该队剩余的淘汰赛场次（已整体作废的场次跳过）
+      ms.filter(m => !m.group_name && !removedIds.has(m.id)).forEach(applyMatch)
+    } else {
+      ms.forEach(applyMatch)
+    }
     rebuildStandings(reg.sport_id)
+    // 级联对账：移除已生成但晋级依据失效的未赛后续轮次（含解除其裁判安排）
+    impact.rebuilt += reconcileKnockout(reg.sport_id, why, reviewer || '系统')
   } else {
     run(`UPDATE athletes SET status=? WHERE id=?`, newStatus, reg.athlete_id)
     // 田径：删除该运动员在该项目的成绩
@@ -946,6 +1083,8 @@ app.post('/api/matches/:id/score', (req, res) => {
   const { score_a, score_b, tb_a, tb_b } = req.body
   const m = get('SELECT * FROM matches WHERE id=?', Number(req.params.id))
   if (!m) return res.status(404).json({ error: '场次不存在' })
+  if (m.status === 'void') return res.status(400).json({ error: '该场次成绩已取消（退报/撤销资格），不能录入比分' })
+  if (m.status === 'finished') return res.status(400).json({ error: '该场次已完赛，如需更正请先联系组委会处理' })
   if (m.team_a == null || m.team_b == null) return res.status(400).json({ error: '对阵尚未编排，先编排淘汰赛' })
   const sa = Number(score_a), sb = Number(score_b)
   if (!Number.isInteger(sa) || !Number.isInteger(sb) || sa < 0 || sb < 0) return res.status(400).json({ error: '比分必须为非负整数' })

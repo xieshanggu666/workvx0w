@@ -21,17 +21,19 @@ const canKO = sid => {
   const s = store.sports.find(x => x.id === sid)
   if (!s || s.format === 'roundrobin' || s.format === 'track') return false
   const ms = store.matches.filter(m => m.sport_id === sid)
-  const hasFinal = ms.some(m => m.stage === '决赛')
+  // 成绩已取消（退报/撤销）同样视为该轮终局
+  const settled = m => m.status === 'finished' || m.status === 'void'
+  const hasFinal = ms.some(m => m.stage === '决赛' || m.stage === '季军')
   if (s.format === 'knockout') {
     const semis = ms.filter(m => m.stage === '半决赛')
-    return !hasFinal && semis.length > 0 && semis.every(m => m.status === 'finished')
+    return !hasFinal && semis.length > 0 && semis.every(settled)
   }
   const groups = ['A组', 'B组']
-  const grouped = groups.every(g => { const gms = ms.filter(m => m.group_name === g); return gms.length > 0 && gms.every(m => m.status === 'finished') })
+  const grouped = groups.every(g => { const gms = ms.filter(m => m.group_name === g); return gms.length > 0 && gms.every(settled) })
   const hasSemi = ms.some(m => m.stage === '半决赛')
   const semis = ms.filter(m => m.stage === '半决赛')
   if (!hasSemi) return grouped
-  return !hasFinal && semis.length > 0 && semis.every(m => m.status === 'finished')
+  return !hasFinal && semis.length > 0 && semis.every(settled)
 }
 </script>
 
