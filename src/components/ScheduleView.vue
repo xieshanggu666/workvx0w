@@ -27,7 +27,9 @@ const canKO = sid => {
     return !hasFinal && semis.length > 0 && semis.every(m => m.status === 'finished')
   }
   const groups = ['A组', 'B组']
-  const grouped = groups.every(g => { const gms = ms.filter(m => m.group_name === g); return gms.length > 0 && gms.every(m => m.status === 'finished') })
+  // 已取消（void）场次视为已了结，不阻塞淘汰赛编排
+  const resolved = m => m.status === 'finished' || m.status === 'void'
+  const grouped = groups.every(g => { const gms = ms.filter(m => m.group_name === g); return gms.length > 0 && gms.every(resolved) })
   const hasSemi = ms.some(m => m.stage === '半决赛')
   const semis = ms.filter(m => m.stage === '半决赛')
   if (!hasSemi) return grouped
